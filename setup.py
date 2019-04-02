@@ -7,7 +7,7 @@ with io.open("README.rst", "rt", encoding="utf8") as f:
 
 setup(
     name="serial_uploader",
-    version="0.1",
+    version="0.1.1",
     author="David Caro",
     author_email="david@dcaro.es",
     maintainer="David Caro",

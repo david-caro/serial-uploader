@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
 import time
 import getpass
+from typing import Optional
 
 import click
 import serial
 
 
-def _in_error(result):
+def _in_error(result: str) -> str:
     return "invalid" in result.lower()
 
 
-def _send_line(handler, line, wait=True, allow_fail=False, tries=100, append_newline=True, extra_wait=0.0):
+def _send_line(
+    handler: serial.Serial,
+    line: str,
+    wait: bool = True,
+    allow_fail: bool = False,
+    tries: int = 100,
+    append_newline: bool = True,
+    extra_wait: float = 0.0,
+    retry_interval: float = 0.1
+) -> str:
     if append_newline:
         line = line.strip() + "\r\n"
 
@@ -26,11 +36,9 @@ def _send_line(handler, line, wait=True, allow_fail=False, tries=100, append_new
         time.sleep(extra_wait)
 
     while handler.inWaiting() or not result_bytes and tries_left:
-        if result_bytes:
-            print(f"   Waiting for {handler.inWaiting()} bytes, got {len(result_bytes)}...")
         new_chunk = handler.read(handler.inWaiting())
         result_bytes += new_chunk
-        time.sleep(0.01)
+        time.sleep(retry_interval)
         tries_left -= 1
 
     if not tries_left:
@@ -46,8 +54,14 @@ def _send_line(handler, line, wait=True, allow_fail=False, tries=100, append_new
 
 
 
-def _wait_for(handler, expected_string, tries=10):
-    result = ""
+def _wait_for(
+    handler: serial.Serial,
+    expected_string: str,
+    tries: int = 10,
+    debug: bool = False,
+    current_result: str = "",
+) -> str:
+    result = current_result
     tries_left = tries
     print(f"@@@@    Waiting for {expected_string}...")
     while expected_string not in result:
@@ -60,18 +74,31 @@ def _wait_for(handler, expected_string, tries=10):
                     f"{tries} times."
                 ) from error
 
+            if debug:
+                print(f"Try #{tries - tries_left}")
+                print(f"Got response:\n{result}")
             print("@@@@        Retrying...")
             tries_left -= 1
 
     return result
 
 
-def _authenticate(handler, user, password):
+def _authenticate(
+    handler: serial.Serial, user: str, password: str, current_result: str = "",
+) -> str:
     print("#####  Authenticating...")
-    _wait_for(handler=handler, expected_string="Username")
+    _wait_for(
+        handler=handler,
+        expected_string="Username",
+        current_result=current_result,
+    )
     result = _send_line(handler=handler, line=user + "\n", append_newline=False)
     if "Password" not in result:
-        _wait_for(handler=handler, expected_string="Password")
+        result = _wait_for(
+            handler=handler,
+            expected_string="Password",
+            current_result=result,
+        )
 
     result = _send_line(handler=handler, line=password)
     if "Authentication failed" in result:
@@ -81,7 +108,7 @@ def _authenticate(handler, user, password):
     return result
 
 
-def _make_sure_we_are_in_the_first_screen(handler):
+def _make_sure_we_are_in_the_first_screen(handler: serial.Serial) -> str:
     print("Exiting a bazillion times to make sure we are at the top level")
     _send_line(handler=handler, line="exit", wait=False, allow_fail=True)
     _send_line(handler=handler, line="exit", wait=False, allow_fail=True)
@@ -102,24 +129,36 @@ def _make_sure_we_are_in_the_first_screen(handler):
         _send_line(handler=handler, line="", wait=False)
         _send_line(handler=handler, line="", wait=False)
         try:
+            time.sleep(0.1)
             result = _send_line(handler=handler, line="", tries=10)
         except Exception:
             pass
 
+    if "[yes/no]" in result:
+        print("This seems to be an uncofigured device.")
+        result = _send_line(handler=handler, line="no", tries=10)
 
-def _open_device_config(handler, user, password):
-    _make_sure_we_are_in_the_first_screen(handler=handler)
+    return result
 
-    if user:
-        _authenticate(handler=handler, user=user, password=password)
 
-    result = _send_line(handler=handler, line="enable\n", allow_fail=True, append_newline=False)
-    # sometimes the config might not be complete, and requires reauth for enable
-    if "Password" in result:
-        result = _send_line(handler=handler, line=password)
+def _open_device_config(handler: serial.Serial, user: str, password: str) -> None:
+    result = _make_sure_we_are_in_the_first_screen(handler=handler)
+    if "User" in result or "Password" in result or "Authentication" in result:
+        print("It looks like authentication is required.")
+        if not user:
+            user = input("Username: ")
+        if not password:
+            password = getpass.getpass("Password: ")
+
+        result = _authenticate(
+            handler=handler, user=user, password=password, current_result=result,
+        )
         if "Authentication failed" in result:
             raise Exception("Enable authentication failed")
+    else:
+        print("It looks like authentication is not needed.")
 
+    result = _send_line(handler=handler, line="enable\n", allow_fail=True, append_newline=False)
     _send_line(handler=handler, line="configure terminal")
     _send_line(handler=handler, line="")
 
@@ -128,7 +167,19 @@ def _open_device_config(handler, user, password):
 @click.option("-c", "--config-file")
 @click.option("-s", "--serial-device-path", default="/dev/ttyUSB0")
 @click.option("-u", "--user", default=None)
-def upload_config(config_file, serial_device_path, user):
+@click.option("-i", "--retry-interval", default=0.01)
+@click.option(
+    "--persist/--no-persist",
+    help="Persist or not the running config after the upload (enabled by default).",
+    default=True,
+)
+def upload_config(
+    config_file: str,
+    serial_device_path: str,
+    user: Optional[str],
+    retry_interval: float,
+    persist: bool,
+) -> None:
     start = time.time()
     click.echo(f"Uploading config {config_file} to device {serial_device_path}")
     serial_handler = serial.Serial(port=serial_device_path, baudrate=9600)
@@ -143,9 +194,12 @@ def upload_config(config_file, serial_device_path, user):
 
     _open_device_config(handler=serial_handler, user=user, password=password)
     next_tries = 100
+    original_retry_interval = retry_interval
+    next_retry_interval = retry_interval
     lines = open(config_file).readlines()
     for linenum, line in enumerate(lines):
         tries = next_tries
+        retry_interval = next_retry_interval
         extra_wait = 0.0
         line = line.strip()
 
@@ -158,8 +212,10 @@ def upload_config(config_file, serial_device_path, user):
         if "crypto key generate" in line:
             next_tries = 5000
             extra_wait = 2.0
+            next_retry_interval = 0.1
         else:
             next_tries = 100
+            next_retry_interval = original_retry_interval
 
         click.echo(
             f"Sending line number {linenum + 1} of {len(lines)}:\n"
@@ -171,6 +227,7 @@ def upload_config(config_file, serial_device_path, user):
             allow_fail=allow_fail,
             tries=tries,
             extra_wait=extra_wait,
+            retry_interval=retry_interval,
         )
 
         if "crypto key generate" in line:
@@ -179,6 +236,19 @@ def upload_config(config_file, serial_device_path, user):
                 "execute, be patient!"
             )
 
+    if persist:
+        click.echo("Persisting configuration...")
+        _send_line(handler=serial_handler, line="end", wait=True, allow_fail=True)
+        result = _send_line(
+            handler=serial_handler,
+            line="copy running-config startup-config",
+            allow_fail=False,
+            tries=tries,
+            extra_wait=extra_wait,
+            retry_interval=retry_interval,
+        )
+
     _make_sure_we_are_in_the_first_screen(handler=serial_handler)
     end = time.time()
     click.echo(f"DONE!! It took {end - start} seconds \o/")
+

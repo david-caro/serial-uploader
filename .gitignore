@@ -1,3 +1,5 @@
 dist
 *.egg-info
 *.sw?
+*/__pycache__
+build/
